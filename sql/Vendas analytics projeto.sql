@@ -1,7 +1,7 @@
 -- ============================================================
 -- VENDAS ANALYTICS — Script Completo
 -- Banco: Vendas_Analytics | SQL Server
--- Inclui: Tabelas, Dados Simulados e 6 Views Analíticas
+-- Inclui: Tabelas, Dados Simulados e 7 Views Analíticas
 -- Técnicas: CTEs, Window Functions (LAG, RANK, SUM OVER),
 --           Running Total, Classificação ABC
 -- Autor: Daniel Luiz Gondim Mendes Bezerra
@@ -457,7 +457,8 @@ WITH vendas_mensais AS (
         FORMAT(data_venda, 'MMM/yyyy')          AS periodo,
         COUNT(DISTINCT id_venda)                AS qtd_pedidos,
         SUM(receita_liquida)                    AS receita_total,
-        AVG(receita_liquida / quantidade)       AS ticket_medio,
+        -- Ticket médio = receita ÷ pedidos (não a média do preço por unidade)
+        SUM(receita_liquida) / COUNT(DISTINCT id_venda) AS ticket_medio,
         COUNT(DISTINCT id_cliente)              AS clientes_ativos
     FROM fato_vendas
     GROUP BY
@@ -473,6 +474,10 @@ SELECT
     ROUND(receita_total, 2)             AS receita_total,
     ROUND(ticket_medio, 2)              AS ticket_medio,
     clientes_ativos,
+    ROUND(SUM(receita_total) OVER (
+        PARTITION BY ano ORDER BY mes
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ), 2)                               AS receita_acumulada_ano,
     LAG(receita_total, 12) OVER (
         ORDER BY ano, mes
     )                                   AS receita_ano_anterior,
@@ -498,9 +503,11 @@ WITH receita_produto AS (
         p.categoria,
         p.preco_unitario,
         SUM(f.quantidade)               AS qtd_vendida,
+        SUM(f.receita_bruta)            AS receita_bruta,
         SUM(f.receita_liquida)          AS receita_total,
         COUNT(DISTINCT f.id_venda)      AS qtd_pedidos,
-        AVG(f.desconto_pct)             AS desconto_medio_pct
+        -- Desconto efetivo: quanto da receita bruta foi concedido em desconto
+        (1 - SUM(f.receita_liquida) / SUM(f.receita_bruta)) * 100 AS desconto_medio_pct
     FROM fato_vendas f
     INNER JOIN dim_produtos p ON f.id_produto = p.id_produto
     GROUP BY p.id_produto, p.produto, p.categoria, p.preco_unitario
@@ -528,26 +535,44 @@ SELECT
     categoria,
     preco_unitario,
     qtd_vendida,
+    ROUND(receita_bruta, 2)             AS receita_bruta,
     ROUND(receita_total, 2)             AS receita_total,
     qtd_pedidos,
     ROUND(desconto_medio_pct, 1)        AS desconto_medio_pct,
     ROUND(participacao_pct, 2)          AS participacao_pct,
     ROUND(participacao_acumulada_pct, 2) AS participacao_acumulada_pct,
+    -- Curva ABC padrão de mercado: A até 80% da receita acumulada, B até 95%, C o restante
     CASE
-        WHEN participacao_acumulada_pct <= 70 THEN 'A'
-        WHEN participacao_acumulada_pct <= 90 THEN 'B'
+        WHEN participacao_acumulada_pct <= 80 THEN 'A'
+        WHEN participacao_acumulada_pct <= 95 THEN 'B'
         ELSE 'C'
     END                                 AS curva_abc
 FROM acumulado;
 GO
 
 -- VIEW 3: Performance de Vendedores com Meta vs Realizado
--- Técnica: CTE + RANK() por receita + % atingimento de meta
+-- Técnica: CTE + CROSS JOIN (vendedor x ano) + LEFT JOIN + RANK()
+-- Todo vendedor aparece em todos os anos, mesmo sem vendas (receita 0),
+-- para que a meta dele entre no total e ninguém "suma" da análise
 -- ============================================================
 IF OBJECT_ID('vw_performance_vendedores', 'V') IS NOT NULL DROP VIEW vw_performance_vendedores;
 GO
 CREATE VIEW vw_performance_vendedores AS
-WITH vendas_vendedor AS (
+WITH anos AS (
+    SELECT DISTINCT YEAR(data_venda) AS ano FROM fato_vendas
+),
+vendas AS (
+    SELECT
+        id_vendedor,
+        YEAR(data_venda)                AS ano,
+        SUM(receita_liquida)            AS receita_realizada,
+        COUNT(DISTINCT id_venda)        AS qtd_pedidos,
+        COUNT(DISTINCT id_cliente)      AS clientes_atendidos,
+        (1 - SUM(receita_liquida) / SUM(receita_bruta)) * 100 AS desconto_medio_pct
+    FROM fato_vendas
+    GROUP BY id_vendedor, YEAR(data_venda)
+),
+vendas_vendedor AS (
     SELECT
         v.id_vendedor,
         v.nome,
@@ -555,17 +580,15 @@ WITH vendas_vendedor AS (
         v.meta_anual,
         r.regiao,
         r.estado,
-        YEAR(f.data_venda)              AS ano,
-        SUM(f.receita_liquida)          AS receita_realizada,
-        COUNT(DISTINCT f.id_venda)      AS qtd_pedidos,
-        COUNT(DISTINCT f.id_cliente)    AS clientes_atendidos,
-        AVG(f.desconto_pct)             AS desconto_medio_pct
-    FROM fato_vendas f
-    INNER JOIN dim_vendedores v ON f.id_vendedor = v.id_vendedor
-    INNER JOIN dim_regioes r    ON v.id_regiao   = r.id_regiao
-    GROUP BY
-        v.id_vendedor, v.nome, v.cargo, v.meta_anual,
-        r.regiao, r.estado, YEAR(f.data_venda)
+        a.ano,
+        ISNULL(s.receita_realizada, 0)  AS receita_realizada,
+        ISNULL(s.qtd_pedidos, 0)        AS qtd_pedidos,
+        ISNULL(s.clientes_atendidos, 0) AS clientes_atendidos,
+        s.desconto_medio_pct
+    FROM dim_vendedores v
+    CROSS JOIN anos a
+    INNER JOIN dim_regioes r ON v.id_regiao = r.id_regiao
+    LEFT JOIN vendas s       ON s.id_vendedor = v.id_vendedor AND s.ano = a.ano
 )
 SELECT
     id_vendedor,
@@ -679,7 +702,7 @@ WITH kpis AS (
         COUNT(DISTINCT id_cliente)      AS clientes_ativos,
         COUNT(DISTINCT id_produto)      AS produtos_vendidos,
         COUNT(DISTINCT id_vendedor)     AS vendedores_ativos,
-        AVG(desconto_pct)               AS desconto_medio_pct,
+        (1 - SUM(receita_liquida) / SUM(receita_bruta)) * 100 AS desconto_medio_pct,
         SUM(receita_liquida) / COUNT(DISTINCT id_venda) AS ticket_medio
     FROM fato_vendas
     GROUP BY YEAR(data_venda)
@@ -705,6 +728,40 @@ SELECT
 FROM kpis;
 GO
 
+-- VIEW 7: Concentração da Receita por Vendedor, Cliente e Produto
+-- Técnica: UNION ALL + RANK() e SUM() OVER() por dimensão
+-- Mostra quanto da receita de cada ano depende dos maiores itens
+-- ============================================================
+IF OBJECT_ID('vw_concentracao_receita', 'V') IS NOT NULL DROP VIEW vw_concentracao_receita;
+GO
+CREATE VIEW vw_concentracao_receita AS
+WITH base AS (
+    SELECT YEAR(f.data_venda) AS ano, 'Vendedor' AS dimensao, v.nome AS item, SUM(f.receita_liquida) AS receita
+    FROM fato_vendas f INNER JOIN dim_vendedores v ON f.id_vendedor = v.id_vendedor
+    GROUP BY YEAR(f.data_venda), v.nome
+    UNION ALL
+    SELECT YEAR(f.data_venda), 'Cliente', c.razao_social, SUM(f.receita_liquida)
+    FROM fato_vendas f INNER JOIN dim_clientes c ON f.id_cliente = c.id_cliente
+    GROUP BY YEAR(f.data_venda), c.razao_social
+    UNION ALL
+    SELECT YEAR(f.data_venda), 'Produto', p.produto, SUM(f.receita_liquida)
+    FROM fato_vendas f INNER JOIN dim_produtos p ON f.id_produto = p.id_produto
+    GROUP BY YEAR(f.data_venda), p.produto
+)
+SELECT
+    ano,
+    dimensao,
+    item,
+    ROUND(receita, 2)                   AS receita,
+    RANK() OVER (PARTITION BY ano, dimensao ORDER BY receita DESC) AS ranking,
+    ROUND(receita / SUM(receita) OVER (PARTITION BY ano, dimensao) * 100, 2) AS participacao_pct,
+    ROUND(SUM(receita) OVER (
+        PARTITION BY ano, dimensao ORDER BY receita DESC
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) / SUM(receita) OVER (PARTITION BY ano, dimensao) * 100, 2) AS participacao_acumulada_pct
+FROM base;
+GO
+
 -- ============================================================
 -- VERIFICAÇÃO FINAL
 -- ============================================================
@@ -717,4 +774,5 @@ SELECT 'fato_vendas',             COUNT(*)              FROM fato_vendas;
 SELECT * FROM vw_kpis_anuais;
 SELECT * FROM vw_ranking_produtos_abc ORDER BY ranking;
 SELECT * FROM vw_performance_vendedores WHERE ano = 2024 ORDER BY ranking_ano;
+SELECT * FROM vw_concentracao_receita WHERE ano = 2024 AND ranking <= 3 ORDER BY dimensao, ranking;
 GO
